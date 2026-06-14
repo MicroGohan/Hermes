@@ -9,11 +9,25 @@ const DANGEROUS = String(process.env.DANGEROUS_MODE || "true").toLowerCase() ===
 const PERMISSION_MODE = process.env.PERMISSION_MODE || "default";
 const MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-8";
 
+// Le enseñamos a Claude cómo devolver archivos/imágenes por WhatsApp: el puente
+// detecta líneas [[ARCHIVO: /ruta]] en la respuesta, las envía y las quita del texto.
+const SEND_FILE_HINT =
+  "Estás respondiendo a través de un puente de WhatsApp. Si necesitas enviar al " +
+  "usuario un archivo o imagen (algo que generaste, un screenshot, un PDF, etc.), " +
+  "incluye en tu respuesta una línea con el formato EXACTO [[ARCHIVO: /ruta/absoluta]] " +
+  "—una por cada archivo—. Usa rutas absolutas que existan en el disco. El sistema " +
+  "enviará esos archivos por WhatsApp y eliminará esas líneas del texto que lee el usuario.";
+
 let sessionId = null;
 
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const args = ["-p", prompt, "--output-format", "json", "--model", MODEL];
+    const args = [
+      "-p", prompt,
+      "--output-format", "json",
+      "--model", MODEL,
+      "--append-system-prompt", SEND_FILE_HINT,
+    ];
     if (sessionId) args.push("--resume", sessionId);
     if (DANGEROUS) {
       args.push("--dangerously-skip-permissions");

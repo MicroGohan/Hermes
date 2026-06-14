@@ -7,3 +7,6 @@ __pycache__/
 
 # audio de prueba personal (no necesario para el repo)
 stt/ejemplo.wav
+
+# archivos recibidos por WhatsApp (personales, no subir)
+media/

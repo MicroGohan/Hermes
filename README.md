@@ -10,6 +10,8 @@ WhatsApp ─▶ Baileys (Node) ─▶ Whisper residente (Python) ─▶ claude -
 
 - **Texto y audio**: las notas de voz se transcriben localmente con `faster-whisper`
   (modelo `large-v3-turbo`, en CPU, sin enviar tu audio a ningún lado).
+- **Imágenes y archivos**: envíale una foto, PDF o documento (con un pie de foto como
+  instrucción) y Claude lo analiza. Claude también puede **devolverte** archivos/imágenes.
 - **Privado**: solo responde a TU número (whitelist). Ignora grupos y desconocidos.
 - **Con memoria**: mantiene la conversación entre mensajes (`/reset` para empezar de cero).
 
@@ -50,6 +52,11 @@ Desde tu número, escríbele al número-bot:
 
 - **Texto**: `crea un archivo notas.txt con la lista del super`
 - **Nota de voz**: habla normal; te contesta `📝 Entendí: ...` y luego ejecuta.
+- **Imagen / archivo**: adjúntalo y escribe el pie de foto como instrucción
+  (ej. una foto de un recibo con *"¿cuánto pagué de IVA?"*). Se guarda en `media/`
+  y Claude la analiza. Si no pones texto, la describe por defecto.
+- **Recibir archivos**: si le pides algo que genere un archivo o imagen, Claude lo
+  manda por el chat (internamente marca `[[ARCHIVO: /ruta]]` y el puente lo envía).
 - **`/reset`**: reinicia la conversación (olvida el contexto anterior).
 
 ---

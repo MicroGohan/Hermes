@@ -8,17 +8,92 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
+  extractMessageContent,
 } = require("baileys");
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 const path = require("node:path");
+const fs = require("node:fs");
 
 const { runClaude, resetSession } = require("./claude-runner");
 
 const ALLOWED = String(process.env.ALLOWED_NUMBER || "").replace(/\D/g, "");
 const STT_URL = process.env.STT_URL || "http://127.0.0.1:8000";
 const AUTH_DIR = path.join(__dirname, "..", "auth");
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(__dirname, "..", "media", "incoming");
 const logger = pino({ level: "silent" });
+
+// --- Manejo de archivos / imágenes -----------------------------------------
+
+// mimetype -> extensión (para nombrar lo que llega sin nombre, p.ej. fotos).
+const MIME_TO_EXT = {
+  "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+  "image/gif": ".gif", "application/pdf": ".pdf",
+};
+// extensión -> mimetype (para enviar documentos con el tipo correcto).
+const EXT_TO_MIME = {
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+  ".webp": "image/webp", ".gif": "image/gif", ".pdf": "application/pdf",
+  ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
+  ".csv": "text/csv", ".zip": "application/zip", ".mp3": "audio/mpeg",
+  ".mp4": "video/mp4",
+};
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+
+// Detecta media entrante soportada (imagen, documento o video) ya desenvuelta.
+function getIncomingMedia(content) {
+  if (!content) return null;
+  if (content.imageMessage) return { kind: "image", node: content.imageMessage };
+  if (content.documentMessage) return { kind: "document", node: content.documentMessage };
+  if (content.videoMessage) return { kind: "video", node: content.videoMessage };
+  return null;
+}
+
+// Guarda el buffer entrante en disco y devuelve la ruta absoluta.
+function saveIncoming(buffer, media) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  let name = media.node.fileName;
+  if (name) {
+    name = `${Date.now()}-${name.replace(/[/\\]/g, "_")}`; // evita colisiones / rutas
+  } else {
+    const ext = MIME_TO_EXT[media.node.mimetype] || (media.kind === "image" ? ".jpg" : "");
+    name = `${media.kind}-${Date.now()}${ext}`;
+  }
+  const filePath = path.join(MEDIA_DIR, name);
+  fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+// Envía un archivo por WhatsApp: imagen si lo es por extensión, si no documento.
+async function sendFile(sock, jid, filePath) {
+  if (!fs.existsSync(filePath)) {
+    await sock.sendMessage(jid, { text: `⚠️ No encontré el archivo a enviar: ${filePath}` });
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  if (IMAGE_EXTS.has(ext)) {
+    await sock.sendMessage(jid, { image: { url: filePath } });
+  } else {
+    await sock.sendMessage(jid, {
+      document: { url: filePath },
+      fileName: path.basename(filePath),
+      mimetype: EXT_TO_MIME[ext] || "application/octet-stream",
+    });
+  }
+}
+
+// Extrae las rutas marcadas con [[ARCHIVO: ...]] y las quita del texto.
+function extractOutgoingFiles(reply) {
+  const files = [];
+  const text = String(reply || "")
+    .replace(/\[\[ARCHIVO:\s*([^\]]+?)\]\]/g, (_, p) => {
+      files.push(p.trim());
+      return "";
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { text, files };
+}
 
 // Compara dos números por sus últimos 10 dígitos (evita líos con prefijos 52 / 521).
 function sameNumber(a, b) {
@@ -81,9 +156,12 @@ async function handleMessage(sock, msg) {
   }
 
   const m = msg.message;
-  let text = m.conversation || m.extendedTextMessage?.text || "";
-  const audio = m.audioMessage;
+  const content = extractMessageContent(m) || m; // desenvuelve efímeros / view-once / doc+caption
+  let text = content.conversation || content.extendedTextMessage?.text || "";
+  const audio = content.audioMessage;
+  const media = getIncomingMedia(content);
 
+  // Nota de voz -> transcripción local con Whisper.
   if (!text && audio) {
     await sock.sendPresenceUpdate("composing", jid);
     const buffer = await downloadMediaMessage(
@@ -101,9 +179,40 @@ async function handleMessage(sock, msg) {
     await sock.sendMessage(jid, { text: `📝 _Entendí:_ ${text || "(vacío)"}` });
   }
 
+  // Imagen / documento / video -> se guarda en disco y se le pasa la ruta a Claude.
+  let mediaNote = "";
+  if (media) {
+    await sock.sendPresenceUpdate("composing", jid);
+    let savedPath;
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        { logger, reuploadRequest: sock.updateMediaMessage }
+      );
+      savedPath = saveIncoming(buffer, media);
+    } catch (e) {
+      await sock.sendMessage(jid, { text: "⚠️ No pude descargar el archivo: " + e.message });
+      return;
+    }
+    const caption = (media.node.caption || "").trim();
+    if (caption) text = caption; // el pie de foto/archivo se usa como instrucción
+    const label =
+      media.kind === "image" ? "una imagen" : media.kind === "video" ? "un video" : "un archivo";
+    mediaNote = `[El usuario adjuntó ${label}, guardada en disco en: ${savedPath}]`;
+    await sock.sendMessage(jid, { text: `📎 _Recibí:_ ${path.basename(savedPath)}` });
+  }
+
   text = (text || "").trim();
-  if (!text) {
-    await sock.sendMessage(jid, { text: "No recibí texto ni audio que pueda procesar 🤔" });
+
+  // Si mandó solo un archivo sin instrucción, ponemos una por defecto.
+  if (!text && media) {
+    text = media.kind === "image" ? "Analiza y describe esta imagen." : "Analiza este archivo.";
+  }
+
+  if (!text && !media) {
+    await sock.sendMessage(jid, { text: "No recibí texto, audio ni archivo que pueda procesar 🤔" });
     return;
   }
 
@@ -116,15 +225,35 @@ async function handleMessage(sock, msg) {
   await sock.sendPresenceUpdate("composing", jid);
   await sock.sendMessage(jid, { text: "🤖 Procesando…" });
 
+  const prompt = mediaNote ? `${mediaNote}\n\n${text}` : text;
+
   const t0 = Date.now();
   let reply;
   try {
-    reply = await runClaude(text);
+    reply = await runClaude(prompt);
   } catch (e) {
     reply = "⚠️ Error ejecutando Claude:\n" + (e.message || String(e));
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
-  await sendLong(sock, jid, `${reply}\n\n_⏱ ${secs}s_`);
+
+  // Enviar de vuelta los archivos que Claude haya marcado con [[ARCHIVO: ...]].
+  const { text: cleanReply, files } = extractOutgoingFiles(reply);
+  for (const f of files) {
+    try {
+      await sendFile(sock, jid, f);
+    } catch (e) {
+      await sock.sendMessage(jid, { text: `⚠️ No pude enviar ${f}: ${e.message}` });
+    }
+  }
+
+  const footer = `_⏱ ${secs}s_`;
+  if (cleanReply) {
+    await sendLong(sock, jid, `${cleanReply}\n\n${footer}`);
+  } else if (files.length) {
+    await sock.sendMessage(jid, { text: footer }); // solo se enviaron archivos
+  } else {
+    await sendLong(sock, jid, `(sin respuesta)\n\n${footer}`);
+  }
 }
 
 async function start() {
