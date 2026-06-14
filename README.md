@@ -57,7 +57,24 @@ Desde tu número, escríbele al número-bot:
   y Claude la analiza. Si no pones texto, la describe por defecto.
 - **Recibir archivos**: si le pides algo que genere un archivo o imagen, Claude lo
   manda por el chat (internamente marca `[[ARCHIVO: /ruta]]` y el puente lo envía).
-- **`/reset`**: reinicia la conversación (olvida el contexto anterior).
+
+### Temas (sesiones con nombre)
+
+Puedes tener varias conversaciones separadas (ej. `fit`, `trabajo`, `random`), cada
+una con su propio contexto y memoria. Se guardan en disco (`state/sessions.json`), así
+que sobreviven reinicios. El pie de cada respuesta muestra el tema activo (`🗂️`).
+
+| Comando | Qué hace |
+|---|---|
+| `/temas` | Muestra el menú de temas; responde con el **número** para cambiar |
+| `/tema <nombre>` | Crea o cambia de tema (ej. `/tema fit`) |
+| `/reset` | Vacía el contexto del tema actual |
+| `/compact` | Resume el tema actual y arranca limpio desde ese resumen (ahorra tokens) |
+| `/borrar <nombre>` | Elimina un tema |
+| `/ayuda` | Lista los comandos |
+
+> Saltar de tema en vez de mezclar todo en una sola charla evita arrastrar contexto
+> que no toca → menos tokens y respuestas más enfocadas.
 
 ---
 

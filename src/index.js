@@ -15,7 +15,15 @@ const pino = require("pino");
 const path = require("node:path");
 const fs = require("node:fs");
 
-const { runClaude, resetSession } = require("./claude-runner");
+const {
+  runClaude,
+  resetTopic,
+  activeTopic,
+  listTopics,
+  switchTopic,
+  deleteTopic,
+  compactActive,
+} = require("./claude-runner");
 
 const ALLOWED = String(process.env.ALLOWED_NUMBER || "").replace(/\D/g, "");
 const STT_URL = process.env.STT_URL || "http://127.0.0.1:8000";
@@ -93,6 +101,92 @@ function extractOutgoingFiles(reply) {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { text, files };
+}
+
+// --- Comandos y menú de temas ----------------------------------------------
+
+// Orden de temas mostrado en el último /temas, para resolver la selección por número.
+let pendingMenu = null;
+
+const HELP =
+  "📋 *Comandos de Hermes*\n" +
+  "/temas — ver y elegir tema (responde con el número)\n" +
+  "/tema <nombre> — crear o cambiar de tema (ej: /tema fit)\n" +
+  "/reset — vaciar el contexto del tema actual\n" +
+  "/compact — resumir el tema actual para ahorrar tokens\n" +
+  "/borrar <nombre> — eliminar un tema\n" +
+  "/ayuda — esta ayuda";
+
+function buildMenu() {
+  const topics = listTopics();
+  pendingMenu = topics.map((t) => t.name);
+  const lines = topics.map(
+    (t, i) => `${i + 1}. ${t.active ? "👉" : "  "} *${t.name}*${t.started ? "" : " _(vacío)_"}`
+  );
+  return (
+    `🗂️ *Tus temas* (activo 👉):\n\n${lines.join("\n")}\n\n` +
+    "Responde con el *número* para cambiar, o:\n" +
+    "• /tema <nombre> — crear/cambiar\n" +
+    "• /compact — resumir el actual\n" +
+    "• /reset — vaciar el actual"
+  );
+}
+
+// Devuelve true si el texto era un comando (ya atendido); false si es prompt normal.
+async function handleCommand(sock, jid, text) {
+  const [cmd, ...rest] = text.trim().split(/\s+/);
+  const arg = rest.join(" ").trim();
+  switch (cmd.toLowerCase()) {
+    case "/ayuda":
+    case "/help":
+      await sock.sendMessage(jid, { text: HELP });
+      return true;
+    case "/temas":
+    case "/menu":
+      await sock.sendMessage(jid, { text: buildMenu() });
+      return true;
+    case "/tema": {
+      if (!arg) {
+        await sock.sendMessage(jid, { text: buildMenu() });
+        return true;
+      }
+      const r = switchTopic(arg);
+      await sock.sendMessage(jid, {
+        text: r.ok ? `✅ Tema activo: *${r.name}*${r.isNew ? " _(nuevo)_" : ""}` : r.msg,
+      });
+      return true;
+    }
+    case "/reset":
+      resetTopic();
+      await sock.sendMessage(jid, { text: `🧹 Contexto del tema *${activeTopic()}* reiniciado.` });
+      return true;
+    case "/compact":
+    case "/compactar":
+      await sock.sendMessage(jid, { text: "🗜️ Compactando el tema actual… (puede tardar un poco)" });
+      try {
+        const r = await compactActive();
+        await sock.sendMessage(jid, {
+          text: r.ok
+            ? `✅ Tema *${activeTopic()}* compactado. El resumen quedó como nuevo punto de partida.`
+            : r.msg,
+        });
+      } catch (e) {
+        await sock.sendMessage(jid, { text: "⚠️ No pude compactar: " + (e.message || String(e)) });
+      }
+      return true;
+    case "/borrar":
+    case "/eliminar": {
+      if (!arg) {
+        await sock.sendMessage(jid, { text: "Dime qué tema borrar, ej: /borrar random" });
+        return true;
+      }
+      const r = deleteTopic(arg);
+      await sock.sendMessage(jid, { text: r.ok ? `🗑️ Tema *${r.name}* eliminado.` : r.msg });
+      return true;
+    }
+    default:
+      return false; // no es un comando conocido -> se procesa como mensaje normal
+  }
 }
 
 // Compara dos números por sus últimos 10 dígitos (evita líos con prefijos 52 / 521).
@@ -216,10 +310,23 @@ async function handleMessage(sock, msg) {
     return;
   }
 
-  if (text.toLowerCase() === "/reset") {
-    resetSession();
-    await sock.sendMessage(jid, { text: "🧹 Conversación reiniciada." });
-    return;
+  // Comandos y selección de tema (solo en mensajes de texto, no en media adjunta).
+  if (!media) {
+    // Selección por número justo después de mostrar /temas.
+    if (pendingMenu && /^\d+$/.test(text)) {
+      const chosen = pendingMenu[parseInt(text, 10) - 1];
+      pendingMenu = null;
+      if (chosen) {
+        switchTopic(chosen);
+        await sock.sendMessage(jid, { text: `✅ Tema activo: *${chosen}*` });
+      } else {
+        await sock.sendMessage(jid, { text: "Número fuera de rango. Escribe /temas para ver la lista." });
+      }
+      return;
+    }
+    pendingMenu = null; // cualquier otro mensaje cancela la selección pendiente
+
+    if (text.startsWith("/") && (await handleCommand(sock, jid, text))) return;
   }
 
   await sock.sendPresenceUpdate("composing", jid);
@@ -246,7 +353,7 @@ async function handleMessage(sock, msg) {
     }
   }
 
-  const footer = `_⏱ ${secs}s_`;
+  const footer = `_⏱ ${secs}s · 🗂️ ${activeTopic()}_`;
   if (cleanReply) {
     await sendLong(sock, jid, `${cleanReply}\n\n${footer}`);
   } else if (files.length) {

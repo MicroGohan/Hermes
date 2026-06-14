@@ -10,3 +10,6 @@ stt/ejemplo.wav
 
 # archivos recibidos por WhatsApp (personales, no subir)
 media/
+
+# estado de temas/sesiones (IDs locales, personal)
+state/
