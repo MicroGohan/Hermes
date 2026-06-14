@@ -238,6 +238,17 @@ async function sendLong(sock, jid, text) {
   }
 }
 
+// Cola serial: encadena los mensajes para procesarlos de a uno, en orden de
+// llegada. Sin esto, dos mensajes seguidos lanzan procesos `claude` en paralelo
+// (y comandos como /tema se colarían a mitad de una respuesta), corrompiendo el
+// estado de sesiones. Cada turno espera al anterior; un error no rompe la cadena.
+let queue = Promise.resolve();
+function enqueue(task) {
+  const result = queue.then(task);
+  queue = result.catch(() => {}); // mantiene viva la cola aunque un turno falle
+  return result;
+}
+
 async function handleMessage(sock, msg) {
   if (!msg.message || msg.key.fromMe) return;
   const jid = msg.key.remoteJid || "";
@@ -334,10 +345,14 @@ async function handleMessage(sock, msg) {
 
   const prompt = mediaNote ? `${mediaNote}\n\n${text}` : text;
 
+  // Fijamos el tema para todo el turno: la respuesta se archiva aquí aunque el
+  // tema activo cambie entre tanto (defensa extra; la cola ya evita interrupciones).
+  const topic = activeTopic();
+
   const t0 = Date.now();
   let reply;
   try {
-    reply = await runClaude(prompt);
+    reply = await runClaude(prompt, topic);
   } catch (e) {
     reply = "⚠️ Error ejecutando Claude:\n" + (e.message || String(e));
   }
@@ -353,7 +368,7 @@ async function handleMessage(sock, msg) {
     }
   }
 
-  const footer = `_⏱ ${secs}s · 🗂️ ${activeTopic()}_`;
+  const footer = `_⏱ ${secs}s · 🗂️ ${topic}_`;
   if (cleanReply) {
     await sendLong(sock, jid, `${cleanReply}\n\n${footer}`);
   } else if (files.length) {
@@ -389,11 +404,9 @@ async function start() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      try {
-        await handleMessage(sock, msg);
-      } catch (e) {
-        console.error("Error manejando mensaje:", e);
-      }
+      enqueue(() => handleMessage(sock, msg)).catch((e) =>
+        console.error("Error manejando mensaje:", e)
+      );
     }
   });
 }

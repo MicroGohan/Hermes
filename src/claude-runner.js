@@ -55,7 +55,10 @@ function normName(name) {
   return String(name || "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 40);
 }
 
-function runClaude(prompt) {
+// `topic` se fija al inicio del turno (en index.js) y se usa tanto para leer la
+// sesión a reanudar como para guardar el nuevo session_id. Así, aunque el usuario
+// cambie de tema mientras Claude piensa, la respuesta se archiva en el tema correcto.
+function runClaude(prompt, topic = store.active) {
   return new Promise((resolve, reject) => {
     const args = [
       "-p", prompt,
@@ -63,7 +66,7 @@ function runClaude(prompt) {
       "--model", MODEL,
       "--append-system-prompt", SEND_FILE_HINT,
     ];
-    const sid = store.sessions[store.active];
+    const sid = store.sessions[topic];
     if (sid) args.push("--resume", sid);
     if (DANGEROUS) {
       args.push("--dangerously-skip-permissions");
@@ -85,7 +88,7 @@ function runClaude(prompt) {
       try {
         const json = JSON.parse(stdout);
         if (json.session_id) {
-          store.sessions[store.active] = json.session_id;
+          store.sessions[topic] = json.session_id;
           save();
         }
         if (json.is_error) {
@@ -144,17 +147,20 @@ function deleteTopic(name) {
 // Compacta el tema activo: pide un resumen del contexto y arranca una sesión
 // nueva sembrada con ese resumen, para seguir gastando menos tokens.
 async function compactActive() {
-  const sid = store.sessions[store.active];
+  const topic = store.active; // fijamos el tema para todo el compactado
+  const sid = store.sessions[topic];
   if (!sid) return { ok: false, msg: "Este tema aún no tiene conversación que compactar." };
   const summary = await runClaude(
     "Resume de forma concisa y estructurada TODO el contexto importante de nuestra " +
     "conversación hasta ahora (hechos, datos, decisiones, estado y preferencias) para " +
-    "poder continuar sin perder lo esencial. Devuelve SOLO el resumen, sin preámbulo."
+    "poder continuar sin perder lo esencial. Devuelve SOLO el resumen, sin preámbulo.",
+    topic
   );
-  store.sessions[store.active] = null; // corta la sesión larga
+  store.sessions[topic] = null; // corta la sesión larga
   save();
   await runClaude(
-    `Contexto previo (resumen compactado de la conversación anterior de este tema):\n\n${summary}`
+    `Contexto previo (resumen compactado de la conversación anterior de este tema):\n\n${summary}`,
+    topic
   );
   return { ok: true, summary };
 }
