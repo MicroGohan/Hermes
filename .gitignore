@@ -1,0 +1,9 @@
+node_modules/
+stt/venv/
+auth/
+.env
+*.log
+__pycache__/
+
+# audio de prueba personal (no necesario para el repo)
+stt/ejemplo.wav

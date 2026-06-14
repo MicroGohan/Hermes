@@ -1,0 +1,15 @@
+{
+  "name": "hermes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Puente WhatsApp -> Claude Code (texto y notas de voz)",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc13",
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
