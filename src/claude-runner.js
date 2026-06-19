@@ -6,6 +6,7 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
 
 const WORK_DIR = process.env.WORK_DIR || process.env.HOME;
 const DANGEROUS = String(process.env.DANGEROUS_MODE || "true").toLowerCase() === "true";
@@ -20,8 +21,10 @@ const SEND_FILE_HINT =
   "Estás respondiendo a través de un puente de WhatsApp. Si necesitas enviar al " +
   "usuario un archivo o imagen (algo que generaste, un screenshot, un PDF, etc.), " +
   "incluye en tu respuesta una línea con el formato EXACTO [[ARCHIVO: /ruta/absoluta]] " +
-  "—una por cada archivo—. Usa rutas absolutas que existan en el disco. El sistema " +
-  "enviará esos archivos por WhatsApp y eliminará esas líneas del texto que lee el usuario.";
+  "—una por cada archivo—. Para enviar un STICKER de WhatsApp usa en su lugar una línea " +
+  "[[STICKER: /ruta/absoluta]] (cualquier imagen sirve; el sistema la convierte a WebP " +
+  "512×512). Usa rutas absolutas que existan en el disco. El sistema enviará esos " +
+  "archivos/stickers por WhatsApp y eliminará esas líneas del texto que lee el usuario.";
 
 // --- Estado de temas (persistido en disco) ---------------------------------
 const DEFAULT_TOPIC = "general";
@@ -165,6 +168,88 @@ async function compactActive() {
   return { ok: true, summary };
 }
 
+// --- Puente con la consola (mismas sesiones de Claude Code) -----------------
+// La consola y Hermes comparten el MISMO almacén de sesiones: Claude Code guarda
+// cada sesión en ~/.claude/projects/<WORK_DIR codificado>/<session_id>.jsonl.
+// Por eso un session_id creado por WhatsApp se puede reanudar en la terminal con
+// `claude --resume <id>` (y al revés). Estos helpers exponen ese puente.
+
+// Codifica WORK_DIR igual que Claude Code: cada caracter no alfanumérico -> "-".
+function projectDir() {
+  const enc = String(WORK_DIR).replace(/[^a-zA-Z0-9]/g, "-");
+  return path.join(os.homedir(), ".claude", "projects", enc);
+}
+
+// Lee solo el inicio de un archivo (las sesiones pueden pesar varios MB).
+function readHead(file, bytes = 65536) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Etiqueta corta para una sesión: su resumen o el primer mensaje del usuario.
+function sessionLabel(file) {
+  let label = "";
+  try {
+    for (const line of readHead(file).split("\n")) {
+      if (!line.trim()) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      if (o.type === "summary" && o.summary) { label = o.summary; break; }
+      const m = o.message || o;
+      if ((o.type === "user" || m.role === "user") && m.content) {
+        const c = m.content;
+        if (typeof c === "string") { label = c; break; }
+        if (Array.isArray(c)) {
+          const t = c.find((p) => typeof p.text === "string");
+          if (t) { label = t.text; break; }
+        }
+      }
+    }
+  } catch { /* sin etiqueta */ }
+  return label.replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
+// Sesión (session_id) del tema activo y su tema.
+function currentSession() {
+  return { topic: store.active, sid: store.sessions[store.active] };
+}
+
+// Engancha un session_id existente al tema activo (o al indicado).
+function setSession(id, topic = store.active) {
+  store.sessions[topic] = id || null;
+  store.active = topic;
+  save();
+  return { ok: true, topic, sid: store.sessions[topic] };
+}
+
+// Lista las sesiones de consola de este WORK_DIR, más recientes primero.
+function recentSessions(limit = 8) {
+  let files;
+  try {
+    files = fs.readdirSync(projectDir()).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    return [];
+  }
+  const known = new Map(); // session_id -> tema que ya lo usa
+  for (const [topic, sid] of Object.entries(store.sessions)) if (sid) known.set(sid, topic);
+  return files
+    .map((f) => {
+      const full = path.join(projectDir(), f);
+      const id = f.replace(/\.jsonl$/, "");
+      let mtime = 0;
+      try { mtime = fs.statSync(full).mtimeMs; } catch { /* ignore */ }
+      return { id, mtime, label: sessionLabel(full), usedBy: known.get(id) || null };
+    })
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit);
+}
+
 module.exports = {
   runClaude,
   resetTopic,
@@ -173,4 +258,7 @@ module.exports = {
   switchTopic,
   deleteTopic,
   compactActive,
+  currentSession,
+  setSession,
+  recentSessions,
 };

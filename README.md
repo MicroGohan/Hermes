@@ -12,6 +12,9 @@ WhatsApp ─▶ Baileys (Node) ─▶ Whisper residente (Python) ─▶ claude -
   (modelo `large-v3-turbo`, en CPU, sin enviar tu audio a ningún lado).
 - **Imágenes y archivos**: envíale una foto, PDF o documento (con un pie de foto como
   instrucción) y Claude lo analiza. Claude también puede **devolverte** archivos/imágenes.
+- **Stickers**: mándale un sticker y Claude lo "ve". Si es **animado**, el puente extrae
+  sus fotogramas y los arma en una grilla para que perciba el movimiento. Claude también
+  puede **responderte con un sticker** (requiere ImageMagick).
 - **Privado**: solo responde a TU número (whitelist). Ignora grupos y desconocidos.
 - **Con memoria**: mantiene la conversación entre mensajes (`/reset` para empezar de cero).
 
@@ -57,6 +60,9 @@ Desde tu número, escríbele al número-bot:
   y Claude la analiza. Si no pones texto, la describe por defecto.
 - **Recibir archivos**: si le pides algo que genere un archivo o imagen, Claude lo
   manda por el chat (internamente marca `[[ARCHIVO: /ruta]]` y el puente lo envía).
+- **Sticker**: mándale uno; los animados se convierten en una grilla de fotogramas para
+  que Claude capte el movimiento. Para que te responda con uno, marca `[[STICKER: /ruta]]`
+  (lo normaliza a WebP 512×512). Necesita `imagemagick` instalado.
 
 ### Temas (sesiones con nombre)
 
@@ -71,10 +77,27 @@ que sobreviven reinicios. El pie de cada respuesta muestra el tema activo (`🗂
 | `/reset` | Vacía el contexto del tema actual |
 | `/compact` | Resume el tema actual y arranca limpio desde ese resumen (ahorra tokens) |
 | `/borrar <nombre>` | Elimina un tema |
+| `/sesion` | Muestra el ID del tema actual y el comando para abrirlo en la consola |
+| `/importar` | Lista tus sesiones de consola para engancharlas a este tema (`/importar <id>` directo) |
 | `/ayuda` | Lista los comandos |
 
 > Saltar de tema en vez de mezclar todo en una sola charla evita arrastrar contexto
 > que no toca → menos tokens y respuestas más enfocadas.
+
+### Puente con la consola (mismas sesiones)
+
+WhatsApp y la consola comparten el **mismo** almacén de sesiones de Claude Code
+(`~/.claude/projects/<WORK_DIR>/<id>.jsonl`). O sea, cada tema de Hermes **es** una
+sesión normal de consola, así que puedes pasar una charla de un lado al otro:
+
+- **WhatsApp → consola**: manda `/sesion`, copia el ID y en la terminal (dentro de
+  `WORK_DIR`) corre `claude --resume <id>`. Sigues la misma conversación.
+- **Consola → WhatsApp**: manda `/importar`, elige por número la sesión de consola
+  que quieras (o `/importar <id>`) y queda enganchada al tema actual; tu próximo
+  mensaje la continúa.
+
+> ⚠️ Usa una sesión en un solo lado a la vez. No la tengas abierta en la terminal
+> *y* escribiéndole por WhatsApp al mismo tiempo, o se pisarían.
 
 ---
 

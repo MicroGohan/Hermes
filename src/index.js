@@ -14,6 +14,7 @@ const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 const path = require("node:path");
 const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
 
 const {
   runClaude,
@@ -23,6 +24,9 @@ const {
   switchTopic,
   deleteTopic,
   compactActive,
+  currentSession,
+  setSession,
+  recentSessions,
 } = require("./claude-runner");
 
 const ALLOWED = String(process.env.ALLOWED_NUMBER || "").replace(/\D/g, "");
@@ -54,7 +58,47 @@ function getIncomingMedia(content) {
   if (content.imageMessage) return { kind: "image", node: content.imageMessage };
   if (content.documentMessage) return { kind: "document", node: content.documentMessage };
   if (content.videoMessage) return { kind: "video", node: content.videoMessage };
+  if (content.stickerMessage) return { kind: "sticker", node: content.stickerMessage };
   return null;
+}
+
+// Un sticker es un WebP (a veces animado). Claude no "ve" animaciones, así que:
+// - estático: lo paso a PNG y se lo doy como imagen normal.
+// - animado: extraigo varios fotogramas y los acomodo en una sola grilla (PNG),
+//   para que Claude perciba el movimiento como una secuencia de cuadros.
+// Devuelve { imagePath, animated, frames }. Requiere ImageMagick (magick/montage).
+function prepareSticker(webpPath) {
+  const base = webpPath.replace(/\.webp$/i, "");
+  let n = 1;
+  try {
+    const out = execFileSync("magick", ["identify", "-format", "%n\n", webpPath], { encoding: "utf8" });
+    n = parseInt(out.trim().split(/\s+/)[0], 10) || 1;
+  } catch { /* si identify falla, lo tratamos como estático */ }
+
+  if (n <= 1) {
+    const png = base + ".png";
+    execFileSync("magick", [`${webpPath}[0]`, png]);
+    return { imagePath: png, animated: false, frames: 1 };
+  }
+
+  // Hasta 9 fotogramas repartidos uniformemente a lo largo de la animación.
+  const max = Math.min(n, 9);
+  const idxs = [...new Set(
+    Array.from({ length: max }, (_, i) => Math.round((i * (n - 1)) / (max - 1)))
+  )];
+  const frames = idxs.map((frameIdx, k) => {
+    const fp = `${base}-f${k}.png`;
+    execFileSync("magick", [`${webpPath}[${frameIdx}]`, fp]);
+    return fp;
+  });
+  const grid = base + "-grid.png";
+  const cols = Math.ceil(Math.sqrt(frames.length));
+  execFileSync("montage", [
+    ...frames,
+    "-tile", `${cols}x`, "-geometry", "+6+6", "-background", "white", grid,
+  ]);
+  for (const fp of frames) { try { fs.unlinkSync(fp); } catch { /* ignore */ } }
+  return { imagePath: grid, animated: true, frames: n };
 }
 
 // Guarda el buffer entrante en disco y devuelve la ruta absoluta.
@@ -90,23 +134,49 @@ async function sendFile(sock, jid, filePath) {
   }
 }
 
-// Extrae las rutas marcadas con [[ARCHIVO: ...]] y las quita del texto.
+// Envía un sticker. Acepta cualquier imagen: la normaliza a WebP 512×512
+// (con relleno transparente) si no lo es ya, porque WhatsApp es quisquilloso.
+async function sendSticker(sock, jid, filePath) {
+  if (!fs.existsSync(filePath)) {
+    await sock.sendMessage(jid, { text: `⚠️ No encontré el sticker a enviar: ${filePath}` });
+    return;
+  }
+  let webp = filePath;
+  if (path.extname(filePath).toLowerCase() !== ".webp") {
+    webp = path.join(MEDIA_DIR, `out-sticker-${Date.now()}.webp`);
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    // encaja la imagen en un lienzo 512×512 transparente, sin recortar.
+    execFileSync("magick", [
+      filePath, "-resize", "512x512", "-background", "none",
+      "-gravity", "center", "-extent", "512x512", webp,
+    ]);
+  }
+  await sock.sendMessage(jid, { sticker: { url: webp } });
+}
+
+// Extrae las rutas marcadas con [[ARCHIVO: ...]] y [[STICKER: ...]] y las quita del texto.
 function extractOutgoingFiles(reply) {
   const files = [];
+  const stickers = [];
   const text = String(reply || "")
     .replace(/\[\[ARCHIVO:\s*([^\]]+?)\]\]/g, (_, p) => {
       files.push(p.trim());
       return "";
     })
+    .replace(/\[\[STICKER:\s*([^\]]+?)\]\]/g, (_, p) => {
+      stickers.push(p.trim());
+      return "";
+    })
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return { text, files };
+  return { text, files, stickers };
 }
 
 // --- Comandos y menú de temas ----------------------------------------------
 
-// Orden de temas mostrado en el último /temas, para resolver la selección por número.
-let pendingMenu = null;
+// Selección pendiente por número (tras /temas o /importar).
+// { kind: "topic", items: ["general", ...] } | { kind: "import", items: [{id,label},...] }
+let pendingSelection = null;
 
 const HELP =
   "📋 *Comandos de Hermes*\n" +
@@ -115,11 +185,13 @@ const HELP =
   "/reset — vaciar el contexto del tema actual\n" +
   "/compact — resumir el tema actual para ahorrar tokens\n" +
   "/borrar <nombre> — eliminar un tema\n" +
+  "/sesion — ver el ID del tema actual (para abrirlo en la consola)\n" +
+  "/importar — enganchar una sesión de la consola a este tema\n" +
   "/ayuda — esta ayuda";
 
 function buildMenu() {
   const topics = listTopics();
-  pendingMenu = topics.map((t) => t.name);
+  pendingSelection = { kind: "topic", items: topics.map((t) => t.name) };
   const lines = topics.map(
     (t, i) => `${i + 1}. ${t.active ? "👉" : "  "} *${t.name}*${t.started ? "" : " _(vacío)_"}`
   );
@@ -129,6 +201,25 @@ function buildMenu() {
     "• /tema <nombre> — crear/cambiar\n" +
     "• /compact — resumir el actual\n" +
     "• /reset — vaciar el actual"
+  );
+}
+
+// Menú de sesiones de consola recientes para importar al tema activo.
+function buildImportMenu() {
+  const sessions = recentSessions();
+  if (!sessions.length) {
+    pendingSelection = null;
+    return "No encontré sesiones de consola en este WORK_DIR todavía.";
+  }
+  pendingSelection = { kind: "import", items: sessions };
+  const lines = sessions.map((s, i) => {
+    const tag = s.usedBy ? ` _(ya es: ${s.usedBy})_` : "";
+    const label = s.label || "(sin texto)";
+    return `${i + 1}. ${label}${tag}\n     \`${s.id.slice(0, 8)}\``;
+  });
+  return (
+    `💻 *Sesiones de consola recientes* (este WORK_DIR):\n\n${lines.join("\n")}\n\n` +
+    `Responde con el *número* para engancharla al tema actual (*${activeTopic()}*).`
   );
 }
 
@@ -182,6 +273,42 @@ async function handleCommand(sock, jid, text) {
       }
       const r = deleteTopic(arg);
       await sock.sendMessage(jid, { text: r.ok ? `🗑️ Tema *${r.name}* eliminado.` : r.msg });
+      return true;
+    }
+    case "/sesion":
+    case "/session":
+    case "/id": {
+      const { topic, sid } = currentSession();
+      if (!sid) {
+        await sock.sendMessage(jid, {
+          text: `El tema *${topic}* aún no tiene conversación. Mándame un mensaje primero y luego /sesion.`,
+        });
+        return true;
+      }
+      await sock.sendMessage(jid, {
+        text:
+          `🗂️ Tema *${topic}*\n🆔 \`${sid}\`\n\n` +
+          `Para abrir esta misma conversación en la terminal:\n` +
+          `\`\`\`\nclaude --resume ${sid}\n\`\`\`\n` +
+          `(ejecútalo dentro de ${process.env.WORK_DIR || process.env.HOME})`,
+      });
+      return true;
+    }
+    case "/importar":
+    case "/import": {
+      if (arg) {
+        const id = arg.trim();
+        if (!/^[0-9a-f-]{8,}$/i.test(id)) {
+          await sock.sendMessage(jid, { text: "Eso no parece un ID de sesión. Usa /importar para ver la lista." });
+          return true;
+        }
+        setSession(id);
+        await sock.sendMessage(jid, {
+          text: `✅ Tema *${activeTopic()}* enganchado a la sesión \`${id.slice(0, 8)}\`. Tu próximo mensaje continúa esa conversación.`,
+        });
+        return true;
+      }
+      await sock.sendMessage(jid, { text: buildImportMenu() });
       return true;
     }
     default:
@@ -303,9 +430,25 @@ async function handleMessage(sock, msg) {
     }
     const caption = (media.node.caption || "").trim();
     if (caption) text = caption; // el pie de foto/archivo se usa como instrucción
-    const label =
-      media.kind === "image" ? "una imagen" : media.kind === "video" ? "un video" : "un archivo";
-    mediaNote = `[El usuario adjuntó ${label}, guardada en disco en: ${savedPath}]`;
+
+    if (media.kind === "sticker") {
+      try {
+        const prep = prepareSticker(savedPath);
+        savedPath = prep.imagePath;
+        mediaNote = prep.animated
+          ? `[El usuario envió un STICKER ANIMADO de WhatsApp (${prep.frames} fotogramas). ` +
+            `Como no podés ver animaciones, lo convertí en UNA sola imagen tipo grilla con varios ` +
+            `fotogramas en orden (izquierda→derecha, arriba→abajo) para que percibas el movimiento. ` +
+            `Imagen en: ${savedPath}]`
+          : `[El usuario envió un sticker de WhatsApp (imagen estática), guardado en: ${savedPath}]`;
+      } catch (e) {
+        mediaNote = `[El usuario envió un sticker (${savedPath}) pero no pude procesar el WebP: ${e.message}]`;
+      }
+    } else {
+      const label =
+        media.kind === "image" ? "una imagen" : media.kind === "video" ? "un video" : "un archivo";
+      mediaNote = `[El usuario adjuntó ${label}, guardada en disco en: ${savedPath}]`;
+    }
     await sock.sendMessage(jid, { text: `📎 _Recibí:_ ${path.basename(savedPath)}` });
   }
 
@@ -313,7 +456,12 @@ async function handleMessage(sock, msg) {
 
   // Si mandó solo un archivo sin instrucción, ponemos una por defecto.
   if (!text && media) {
-    text = media.kind === "image" ? "Analiza y describe esta imagen." : "Analiza este archivo.";
+    text =
+      media.kind === "sticker"
+        ? "El usuario te mandó este sticker. Decile qué ves y respondé acorde, con onda."
+        : media.kind === "image"
+        ? "Analiza y describe esta imagen."
+        : "Analiza este archivo.";
   }
 
   if (!text && !media) {
@@ -323,19 +471,25 @@ async function handleMessage(sock, msg) {
 
   // Comandos y selección de tema (solo en mensajes de texto, no en media adjunta).
   if (!media) {
-    // Selección por número justo después de mostrar /temas.
-    if (pendingMenu && /^\d+$/.test(text)) {
-      const chosen = pendingMenu[parseInt(text, 10) - 1];
-      pendingMenu = null;
-      if (chosen) {
+    // Selección por número justo después de mostrar /temas o /importar.
+    if (pendingSelection && /^\d+$/.test(text)) {
+      const sel = pendingSelection;
+      const chosen = sel.items[parseInt(text, 10) - 1];
+      pendingSelection = null;
+      if (!chosen) {
+        await sock.sendMessage(jid, { text: "Número fuera de rango. Escribe /temas o /importar para ver la lista." });
+      } else if (sel.kind === "topic") {
         switchTopic(chosen);
         await sock.sendMessage(jid, { text: `✅ Tema activo: *${chosen}*` });
-      } else {
-        await sock.sendMessage(jid, { text: "Número fuera de rango. Escribe /temas para ver la lista." });
+      } else if (sel.kind === "import") {
+        setSession(chosen.id);
+        await sock.sendMessage(jid, {
+          text: `✅ Tema *${activeTopic()}* enganchado a \`${chosen.id.slice(0, 8)}\`${chosen.label ? ` — "${chosen.label}"` : ""}. Tu próximo mensaje continúa esa conversación.`,
+        });
       }
       return;
     }
-    pendingMenu = null; // cualquier otro mensaje cancela la selección pendiente
+    pendingSelection = null; // cualquier otro mensaje cancela la selección pendiente
 
     if (text.startsWith("/") && (await handleCommand(sock, jid, text))) return;
   }
@@ -358,8 +512,8 @@ async function handleMessage(sock, msg) {
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
 
-  // Enviar de vuelta los archivos que Claude haya marcado con [[ARCHIVO: ...]].
-  const { text: cleanReply, files } = extractOutgoingFiles(reply);
+  // Enviar de vuelta lo que Claude haya marcado: [[ARCHIVO: ...]] y [[STICKER: ...]].
+  const { text: cleanReply, files, stickers } = extractOutgoingFiles(reply);
   for (const f of files) {
     try {
       await sendFile(sock, jid, f);
@@ -367,12 +521,19 @@ async function handleMessage(sock, msg) {
       await sock.sendMessage(jid, { text: `⚠️ No pude enviar ${f}: ${e.message}` });
     }
   }
+  for (const s of stickers) {
+    try {
+      await sendSticker(sock, jid, s);
+    } catch (e) {
+      await sock.sendMessage(jid, { text: `⚠️ No pude enviar el sticker ${s}: ${e.message}` });
+    }
+  }
 
   const footer = `_⏱ ${secs}s · 🗂️ ${topic}_`;
   if (cleanReply) {
     await sendLong(sock, jid, `${cleanReply}\n\n${footer}`);
-  } else if (files.length) {
-    await sock.sendMessage(jid, { text: footer }); // solo se enviaron archivos
+  } else if (files.length || stickers.length) {
+    await sock.sendMessage(jid, { text: footer }); // solo se enviaron archivos/stickers
   } else {
     await sendLong(sock, jid, `(sin respuesta)\n\n${footer}`);
   }
